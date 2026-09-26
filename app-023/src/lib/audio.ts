@@ -95,23 +95,41 @@ function noiseBuffer(ctx: BaseAudioContext): AudioBuffer {
   return buf;
 }
 
-/** 单击合成：鼓=低频正弦衰减+短噪声、锣/钹=金属噪声+长衰减、木=短脉冲 */
+const FLAM_GAP_S = 0.03; // 双打：第二击延后 30ms
+const ROLL_GAP_S = 0.055; // 滚奏：55ms 均匀补击
+const MUTE_DECAY = 0.3; // 闷击：衰减压到 0.3 倍
+
+/**
+ * 单击合成：鼓=低频正弦衰减+短噪声、锣/钹=失谐泛音+带通噪声、木=短脉冲。
+ * 技法（hit.tech）：flam 双打补第二击、mute 闷击压短余音、roll 滚奏按均匀间隔补到时值结束。
+ * durationS 为该字时值（秒），滚奏补击的终止边界。
+ */
 export function synthesizeHit(
   ctx: BaseAudioContext,
   dest: AudioNode,
   inst: Instrument,
   hit: Hit,
   time: number,
-  rollMs = 55,
+  durationS = 0.3,
 ): void {
+  const tech = hit.tech ?? [];
   const g0 = VELOCITY_GAIN[hit.velocity];
-  const hits: { at: number }[] = [{ at: time }];
+  const decay = Math.max(inst.synth.decay * (tech.includes('mute') ? MUTE_DECAY : 1), 0.02);
 
-  for (const { at } of hits) {
+  // 展开为子击序列：默认单击；双打 +30ms 补一击；滚奏按 55ms 均匀间隔补到时值结束
+  const strikes: { at: number; gain: number }[] = [{ at: time, gain: g0 }];
+  if (tech.includes('flam')) strikes.push({ at: time + FLAM_GAP_S, gain: g0 * 0.85 });
+  if (tech.includes('roll')) {
+    const end = time + Math.max(durationS, ROLL_GAP_S);
+    for (let at = time + ROLL_GAP_S; at < end - 1e-6; at += ROLL_GAP_S) {
+      strikes.push({ at, gain: g0 * 0.8 });
+    }
+  }
+
+  for (const { at, gain } of strikes) {
     const env = ctx.createGain();
     env.connect(dest);
-    const decay = Math.max(inst.synth.decay, 0.02);
-    env.gain.setValueAtTime(g0, at);
+    env.gain.setValueAtTime(gain, at);
     env.gain.exponentialRampToValueAtTime(0.0001, at + decay);
 
     if (inst.synth.type === 'drum') {
@@ -125,12 +143,23 @@ export function synthesizeHit(
       osc.stop(at + decay + 0.02);
       if (inst.synth.noise) attachNoise(ctx, env, at, Math.min(decay, 0.08), 'lowpass', inst.synth.baseHz * 10);
     } else if (inst.synth.type === 'metal') {
-      const osc = ctx.createOscillator();
-      osc.type = 'triangle';
-      osc.frequency.value = inst.synth.baseHz;
-      osc.connect(env);
-      osc.start(at);
-      osc.stop(at + decay + 0.02);
+      // 金属：1 / 1.47 / 2.13 倍三个失谐三角波泛音 + 带通噪声，留住金属撞击的噪感余韵
+      const partials: [ratio: number, gain: number][] = [
+        [1, 1],
+        [1.47, 0.55],
+        [2.13, 0.35],
+      ];
+      for (const [ratio, pGain] of partials) {
+        const osc = ctx.createOscillator();
+        osc.type = 'triangle';
+        osc.frequency.value = inst.synth.baseHz * ratio;
+        const pg = ctx.createGain();
+        pg.gain.value = pGain;
+        osc.connect(pg).connect(env);
+        osc.start(at);
+        osc.stop(at + decay + 0.02);
+      }
+      if (inst.synth.noise) attachNoise(ctx, env, at, Math.min(decay, 0.6), 'bandpass', inst.synth.baseHz * 3);
     } else {
       // 木：短脉冲（高通噪声 + 三角波 blip）
       attachNoise(ctx, env, at, Math.min(decay, 0.05), 'highpass', 1200);
@@ -142,14 +171,6 @@ export function synthesizeHit(
       osc.stop(at + decay + 0.02);
     }
   }
-}
-
-function hitDuration(_hit: Hit): number {
-  return 0.3; // 滚奏默认时值上限（单 hit 无格信息时）
-}
-
-function rollMsToTicks(_ms: number): number {
-  return 1;
 }
 
 function attachNoise(
@@ -198,6 +219,7 @@ export function scheduleEvents(
   onVisual?: (ev: ScheduleEvent) => void,
 ): SchedulerHandle {
   const instMap = new Map(score.instruments.map((i) => [i.id, i]));
+  const per = tickSeconds(score.bpm); // 每格秒数：滚奏时值换算用
   let idx = 0;
   const done: ScheduleEvent[] = [];
   let stopped = false;
@@ -209,7 +231,7 @@ export function scheduleEvents(
       const ev = events[idx++];
       const inst = instMap.get(ev.instrumentId);
       if (!inst) continue;
-      synthesizeHit(ctx, master, inst, ev.hit, ev.time);
+      synthesizeHit(ctx, master, inst, ev.hit, ev.time, ev.durationTicks * per);
       done.push(ev);
       const delay = Math.max((ev.time - now) * 1000, 0);
       window.setTimeout(() => onVisual && onVisual(ev), delay);
