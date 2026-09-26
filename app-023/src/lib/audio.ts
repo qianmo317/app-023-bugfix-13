@@ -9,6 +9,7 @@ import {
   type Instrument,
   type ScheduleEvent,
   type Score,
+  type Tech,
 } from '../types';
 import { barTicks, stepOffsets } from './grid';
 
@@ -53,6 +54,7 @@ export function computeEvents(
           hit,
           glyph: hit.glyph ?? inst.glyphs[0],
           durationTicks: step.beats,
+          durationSeconds: step.beats * per,
         });
       }
     });
@@ -87,7 +89,7 @@ export function computeLoopEvents(
 let noiseBufferCache: AudioBuffer | null = null;
 function noiseBuffer(ctx: BaseAudioContext): AudioBuffer {
   if (noiseBufferCache && noiseBufferCache.sampleRate === ctx.sampleRate) return noiseBufferCache;
-  const len = Math.floor(ctx.sampleRate * 0.5);
+  const len = Math.floor(ctx.sampleRate * 2);
   const buf = ctx.createBuffer(1, len, ctx.sampleRate);
   const data = buf.getChannelData(0);
   for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
@@ -95,61 +97,130 @@ function noiseBuffer(ctx: BaseAudioContext): AudioBuffer {
   return buf;
 }
 
-/** 单击合成：鼓=低频正弦衰减+短噪声、锣/钹=金属噪声+长衰减、木=短脉冲 */
+const FLAM_DELAY_S = 0.03;
+const ROLL_INTERVAL_S = 0.055;
+const MUTE_DECAY_FACTOR = 0.3;
+
+export interface SynthVoice {
+  endsAt: number;
+  stop(): void;
+}
+
+/** 单击合成：鼓=低频正弦衰减+短噪声、锣/钹=金属噪声+失谐泛音、木=短脉冲 */
 export function synthesizeHit(
   ctx: BaseAudioContext,
   dest: AudioNode,
   inst: Instrument,
   hit: Hit,
   time: number,
-  rollMs = 55,
-): void {
+  durationSeconds = 0.3,
+): SynthVoice[] {
   const g0 = VELOCITY_GAIN[hit.velocity];
-  const hits: { at: number }[] = [{ at: time }];
+  const glyph = hit.glyph ?? inst.glyphs[0];
+  // 手工挂上的 hit.tech 优先；旧谱没有 tech 时仍从拟音字反查默认打法。
+  const techs: Tech[] = hit.tech ?? inst.techMap?.[glyph] ?? [];
+  const muted = techs.includes('mute');
+  const decay = Math.max(inst.synth.decay * (muted ? MUTE_DECAY_FACTOR : 1), 0.025);
 
-  for (const { at } of hits) {
-    const env = ctx.createGain();
-    env.connect(dest);
-    const decay = Math.max(inst.synth.decay, 0.02);
-    env.gain.setValueAtTime(g0, at);
-    env.gain.exponentialRampToValueAtTime(0.0001, at + decay);
-
-    if (inst.synth.type === 'drum') {
-      // 低频正弦衰减 + 短噪声敲击
-      const osc = ctx.createOscillator();
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(inst.synth.baseHz, at);
-      osc.frequency.exponentialRampToValueAtTime(Math.max(inst.synth.baseHz * 0.5, 30), at + decay);
-      osc.connect(env);
-      osc.start(at);
-      osc.stop(at + decay + 0.02);
-      if (inst.synth.noise) attachNoise(ctx, env, at, Math.min(decay, 0.08), 'lowpass', inst.synth.baseHz * 10);
-    } else if (inst.synth.type === 'metal') {
-      const osc = ctx.createOscillator();
-      osc.type = 'triangle';
-      osc.frequency.value = inst.synth.baseHz;
-      osc.connect(env);
-      osc.start(at);
-      osc.stop(at + decay + 0.02);
-    } else {
-      // 木：短脉冲（高通噪声 + 三角波 blip）
-      attachNoise(ctx, env, at, Math.min(decay, 0.05), 'highpass', 1200);
-      const osc = ctx.createOscillator();
-      osc.type = 'triangle';
-      osc.frequency.value = inst.synth.baseHz;
-      osc.connect(env);
-      osc.start(at);
-      osc.stop(at + decay + 0.02);
-    }
+  // 滚奏把本字时值均匀切到不宽于 55ms，首击在字头上，末击正好落在时值结束处。
+  let attackTimes: number[] = [time];
+  if (techs.includes('roll')) {
+    const intervals = Math.max(1, Math.ceil(durationSeconds / ROLL_INTERVAL_S));
+    attackTimes = Array.from({ length: intervals + 1 }, (_, i) => time + (durationSeconds * i) / intervals);
   }
+
+  // 双打 = 本击后紧跟一声较轻补击。
+  const attacks: { at: number; scale: number }[] = [];
+  for (const at of attackTimes) {
+    attacks.push({ at, scale: 1 });
+    if (techs.includes('flam')) attacks.push({ at: at + FLAM_DELAY_S, scale: 0.55 });
+  }
+
+  return attacks.map(({ at, scale }) => renderAttack(ctx, dest, inst, at, g0 * scale, decay));
 }
 
-function hitDuration(_hit: Hit): number {
-  return 0.3; // 滚奏默认时值上限（单 hit 无格信息时）
+function renderAttack(
+  ctx: BaseAudioContext,
+  dest: AudioNode,
+  inst: Instrument,
+  at: number,
+  gain: number,
+  decay: number,
+): SynthVoice {
+  const env = ctx.createGain();
+  env.connect(dest);
+  const headroom = inst.synth.type === 'metal' ? 0.7 : 1;
+  env.gain.setValueAtTime(gain * headroom, at);
+  env.gain.exponentialRampToValueAtTime(0.0001, at + decay);
+  const voice: SynthVoice = {
+    endsAt: at + decay + 0.05,
+    stop: () => env.disconnect(),
+  };
+
+  if (inst.synth.type === 'drum') {
+    // 低频正弦下滑 + 短噪声敲击
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(inst.synth.baseHz, at);
+    osc.frequency.exponentialRampToValueAtTime(Math.max(inst.synth.baseHz * 0.5, 30), at + decay);
+    osc.connect(env);
+    osc.start(at);
+    osc.stop(at + decay + 0.02);
+    if (inst.synth.noise) attachNoise(ctx, env, at, Math.min(decay, 0.08), 'lowpass', inst.synth.baseHz * 10, 0.6);
+  } else if (inst.synth.type === 'metal') {
+    renderMetal(ctx, env, inst, at, decay);
+  } else {
+    // 木：短脉冲（高通噪声 + 三角波 blip）
+    attachNoise(ctx, env, at, Math.min(decay, 0.05), 'highpass', 1200, 0.45);
+    const osc = ctx.createOscillator();
+    osc.type = 'triangle';
+    osc.frequency.value = inst.synth.baseHz;
+    osc.connect(env);
+    osc.start(at);
+    osc.stop(at + decay + 0.02);
+  }
+
+  return voice;
 }
 
-function rollMsToTicks(_ms: number): number {
-  return 1;
+function renderMetal(
+  ctx: BaseAudioContext,
+  env: GainNode,
+  inst: Instrument,
+  at: number,
+  decay: number,
+): void {
+  // 非整数倍泛音是锣/钹区别于鼓和梆子的金属感来源。
+  const partials = [
+    { ratio: 1, gain: 0.46, type: 'triangle' as OscillatorType },
+    { ratio: 1.47, gain: 0.26, type: 'triangle' as OscillatorType },
+    { ratio: 2.13, gain: 0.17, type: 'triangle' as OscillatorType },
+    { ratio: 2.92, gain: 0.1, type: 'sine' as OscillatorType },
+    { ratio: 4.06, gain: 0.06, type: 'sine' as OscillatorType },
+  ];
+
+  for (const p of partials) {
+    const osc = ctx.createOscillator();
+    osc.type = p.type;
+    const hz = inst.synth.baseHz * p.ratio;
+    osc.frequency.setValueAtTime(hz, at);
+    if (p.ratio === 1 && inst.synth.baseHz < 250) {
+      osc.frequency.exponentialRampToValueAtTime(hz * 0.92, at + Math.min(decay, 0.35));
+    }
+    const partialGain = ctx.createGain();
+    partialGain.gain.value = p.gain;
+    osc.connect(partialGain).connect(env);
+    osc.start(at);
+    osc.stop(at + decay + 0.04);
+  }
+
+  if (inst.synth.noise) {
+    // 带通噪声负责撞击后的“沙沙”金属噪韵；不同音区使用不同中心频。
+    const noiseFreq = inst.synth.baseHz < 250 ? 720 : inst.synth.baseHz < 450 ? 1650 : 2700;
+    const noiseDecay = Math.min(decay, inst.synth.baseHz < 250 ? 0.55 : 0.28);
+    attachNoise(ctx, env, at, noiseDecay, 'bandpass', noiseFreq, 0.42, 0.75);
+    attachNoise(ctx, env, at, Math.min(noiseDecay * 0.32, 0.08), 'highpass', Math.max(noiseFreq * 2.2, 3200), 0.18);
+  }
 }
 
 function attachNoise(
@@ -159,18 +230,20 @@ function attachNoise(
   dur: number,
   filter: BiquadFilterType,
   freq: number,
+  level: number,
+  q = 0.8,
 ): void {
   const src = ctx.createBufferSource();
   src.buffer = noiseBuffer(ctx);
   const f = ctx.createBiquadFilter();
   f.type = filter;
   f.frequency.value = freq;
-  f.Q.value = filter === 'bandpass' ? 1.2 : 0.8;
+  f.Q.value = q;
   const g = ctx.createGain();
-  g.gain.setValueAtTime(0.6, at);
+  g.gain.setValueAtTime(level, at);
   g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
   src.connect(f).connect(g).connect(dest);
-  src.start(at, Math.random() * 0.3, dur + 0.02);
+  src.start(at, Math.random() * 1.5, dur + 0.03);
 }
 
 // ---------- Lookahead 调度器 ----------
@@ -200,16 +273,20 @@ export function scheduleEvents(
   const instMap = new Map(score.instruments.map((i) => [i.id, i]));
   let idx = 0;
   const done: ScheduleEvent[] = [];
+  const activeVoices: SynthVoice[] = [];
   let stopped = false;
 
   const pump = () => {
     if (stopped) return;
     const now = ctx.currentTime;
+    for (let i = activeVoices.length - 1; i >= 0; i--) {
+      if (activeVoices[i].endsAt <= now) activeVoices.splice(i, 1);
+    }
     while (idx < events.length && events[idx].time < now + LOOKAHEAD_S) {
       const ev = events[idx++];
       const inst = instMap.get(ev.instrumentId);
       if (!inst) continue;
-      synthesizeHit(ctx, master, inst, ev.hit, ev.time);
+      activeVoices.push(...synthesizeHit(ctx, master, inst, ev.hit, ev.time, ev.durationSeconds));
       done.push(ev);
       const delay = Math.max((ev.time - now) * 1000, 0);
       window.setTimeout(() => onVisual && onVisual(ev), delay);
@@ -221,6 +298,9 @@ export function scheduleEvents(
     stop() {
       stopped = true;
       window.clearInterval(timer);
+      const now = ctx.currentTime;
+      activeVoices.filter((v) => v.endsAt > now).forEach((v) => v.stop());
+      activeVoices.length = 0;
     },
     scheduled: () => done.slice(),
     currentTime: () => ctx.currentTime,

@@ -75,6 +75,7 @@ export interface ScheduleEvent {
   hit: Hit;
   glyph: string;
   durationTicks: number;
+  durationSeconds: number;
 }
 
 export const TICKS_PER_BEAT = 4;
